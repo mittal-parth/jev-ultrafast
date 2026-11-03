@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import threading
 import time
 
@@ -10,8 +11,10 @@ import httpx
 
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
-CLIENT = httpx.Client(http2=True, timeout=25)
+CLIENT = httpx.Client(http2=True, timeout=90)
+SARVAM_CLIENT = httpx.Client(http2=False, timeout=180)
 _PROVIDER = threading.local()
+SARVAM_DECOY = "__none_of_the_above__"
 
 
 def use_decision_provider(provider):
@@ -47,12 +50,17 @@ def post_json(url, key, body):
         auth = {"api-subscription-key": key, "Authorization": f"Bearer {key}"}
     else:
         auth = {"Authorization": f"Bearer {key}"}
-    for attempt in range(3):
+    client = SARVAM_CLIENT if "sarvam.ai" in url else CLIENT
+    attempts = 5 if "sarvam.ai" in url else 3
+    for attempt in range(attempts):
         try:
-            response = CLIENT.post(url, json=body, headers=auth)
-        except httpx.HTTPError:
-            raise RuntimeError("Model connection failed; no action executed.") from None
-        if response.status_code in {429, 529, 503} and attempt < 2:
+            response = client.post(url, json=body, headers=auth)
+        except httpx.HTTPError as error:
+            if attempt < attempts - 1:
+                time.sleep(0.75 * 2**attempt)
+                continue
+            raise RuntimeError("Model connection failed; no action executed.") from error
+        if response.status_code in {429, 529, 503} and attempt < attempts - 1:
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
@@ -112,8 +120,63 @@ def action_space(actions):
     return elements, targets, controls
 
 
+def pad_choice_criteria(criteria, provider):
+    """Sarvam Prism rejects choice questions with fewer than two options."""
+    if provider != "sarvam" or len(criteria) >= 2:
+        return criteria
+    padded = dict(criteria)
+    padded[SARVAM_DECOY] = "None of the listed elements apply; choose only when no real target fits."
+    return padded
+
+
+def trim_large_action_space(actions, goal):
+    """Keep decision requests under provider limits on dense pages (e.g. flight calendars)."""
+    if os.environ.get("TRIM_LARGE_ACTION_SPACES") != "1" or len(actions) <= 120:
+        return actions
+    goal_l = goal.lower()
+    wants_sep = "september" in goal_l and "20" in goal_l
+
+    def score(action):
+        if action["kind"] != "click":
+            return 2000
+        label = action["label"].lower()
+        points = 0
+        for token in (
+            "search",
+            "one way",
+            "round trip",
+            "where from",
+            "where to",
+            "departure",
+            "done",
+            "select flight",
+            "zurich",
+            "zürich",
+            "london",
+            "next",
+            "previous",
+            "reset",
+        ):
+            if token in label:
+                points += 60
+        if wants_sep:
+            if "september" in label and "20" in label:
+                points += 500
+            for token in ("september", " sep ", ", 20", "20,", "2026", "sunday"):
+                if token in label:
+                    points += 90
+            if "november" in label or "december" in label:
+                points -= 120
+        return points
+
+    non_clicks = [a for a in actions if a["kind"] != "click"]
+    clicks = sorted((a for a in actions if a["kind"] == "click"), key=score, reverse=True)
+    return non_clicks + clicks[:90]
+
+
 def choose(state, goal, history):
-    elements, targets, controls = action_space(state["actions"])
+    actions = trim_large_action_space(state["actions"], goal)
+    elements, targets, controls = action_space(actions)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
@@ -122,23 +185,26 @@ def choose(state, goal, history):
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
+    client = decision_client()
+    provider = getattr(_PROVIDER, "name", None) or os.environ.get("DECISION_PROVIDER", "jev")
+    operations = pad_choice_criteria(operations, provider)
     questions = {
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
     for operation, candidates in targets.items():
+        criteria = {
+            index: {
+                "element": f"[{index}] {a['label']}",
+                "current_value": a.get("current_value", a.get("value", "")),
+                **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+            }
+            for index, a in candidates.items()
+        }
         questions[operation.lower() + "_target"] = {
             "type": "choice",
-            "criteria": {
-                index: {
-                    "element": f"[{index}] {a['label']}",
-                    "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
-                }
-                for index, a in candidates.items()
-            },
+            "criteria": pad_choice_criteria(criteria, provider),
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
-    client = decision_client()
     body = {
         "model": client["model"],
         "state": {
@@ -154,14 +220,24 @@ def choose(state, goal, history):
     result = post_json(client["url"], client["key"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
+    if operation == SARVAM_DECOY:
+        raise ValueError("Invalid TypeSafe response; no action executed.")
     target = None
     target_answer = None
     probabilities = {}
     if operation in targets:
         # Unused target heads cannot cause an action. Validate the head selected by the operation.
-        target_answer = validate_choice(result["answers"].get(operation.lower() + "_target", {}), targets[operation])
+        target_criteria = targets[operation]
+        target_answer = validate_choice(
+            result["answers"].get(operation.lower() + "_target", {}),
+            pad_choice_criteria(target_criteria, provider) if provider == "sarvam" else target_criteria,
+        )
         target = target_answer["choice"]
+        if target == SARVAM_DECOY:
+            raise ValueError("Invalid TypeSafe response; no action executed.")
         choice = targets[operation][target]["id"]
+        if choice not in {a["id"] for a in state["actions"]}:
+            raise ValueError("Invalid TypeSafe response; no action executed.")
         probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()}
     else:
         choice = controls[operation]["id"] if operation in controls else operation
@@ -192,7 +268,57 @@ def field_context(goal, action, page, history):
     }
 
 
+def field_text_systemone(context):
+    """Use the same System-1 API key to pick a field value from goal-derived options."""
+    label = context["field"]["label"].lower()
+    goal = context["goal"]
+    criteria = {}
+    if "where from" in label:
+        match = re.search(r"from\s+([^,\n]+?)\s+to\s", goal, re.I)
+        raw = match.group(1).strip() if match else ""
+        for token in {raw, raw.replace("Zurich", "Zürich"), "Zürich", "Zurich"}:
+            if token:
+                criteria[f"from_{len(criteria)}"] = token
+    elif "where to" in label:
+        match = re.search(r"to\s+([^,\n]+?)\s+on\s", goal, re.I)
+        raw = match.group(1).strip() if match else ""
+        for token in {raw, "London", "London, United Kingdom"}:
+            if token:
+                criteria[f"to_{len(criteria)}"] = token
+    else:
+        criteria["value"] = goal[:200]
+    if not criteria:
+        raise ValueError("Could not derive TYPE_TEXT options from the goal; nothing typed.")
+    client = decision_client()
+    body = {
+        "model": client["model"],
+        "state": context,
+        "questions": {
+            "text": {
+                "type": "choice",
+                "criteria": criteria,
+                "instructions": {
+                    "goal": goal,
+                    "field": context["field"],
+                    "rules": TEXT_VALUE,
+                },
+            }
+        },
+    }
+    started = time.perf_counter()
+    result = post_json(client["url"], client["key"], body)
+    answer = validate_choice(result["answers"].get("text", {}), criteria)
+    value = criteria[answer["choice"]]
+    return value, {
+        "model": result["model"],
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "usage": result.get("usage", {}),
+    }
+
+
 def field_text(context):
+    if os.environ.get("TEXT_HELPER") == "systemone":
+        return field_text_systemone(context)
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")

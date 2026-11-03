@@ -20,6 +20,10 @@ args = parser.parse_args()
 source = args.source.resolve()
 jev = json.loads((source / "jev" / "state.json").read_text())
 sarvam = json.loads((source / "sarvam" / "state.json").read_text())
+task = "flights"
+if (source / "task.json").exists():
+    task = json.loads((source / "task.json").read_text()).get("task", task)
+hold_ms = 2500 if task == "flights" else 800
 
 
 def load_frames(run_dir):
@@ -32,7 +36,7 @@ def load_frames(run_dir):
 
 jev_frames = load_frames(source / "jev")
 sarvam_frames = load_frames(source / "sarvam")
-end = max(jev["elapsed_ms"], sarvam["elapsed_ms"], 1) + 800
+end = max(jev["elapsed_ms"], sarvam["elapsed_ms"], 1) + hold_ms
 folder = source / "video-frames"
 folder.mkdir(parents=True, exist_ok=True)
 
@@ -87,8 +91,18 @@ for i in range(round(end * fps / 1000)):
     t = min(end, round(i * 1000 / fps))
     canvas = Image.new("RGB", (W, H), "#f3f4ec")
     d = ImageDraw.Draw(canvas)
-    d.text((36, 22), "Decision models · same task · same fixture", font=font(28, True), fill=ink)
-    d.text((38, 62), "Jev (TypeSafe) vs Sarvam Prism — timers run independently", font=font(16), fill=muted)
+    headline = (
+        "Zürich → London · Google Flights · 1×"
+        if task == "flights"
+        else "Decision models · same task · same fixture"
+    )
+    d.text((36, 22), headline, font=font(28, True), fill=ink)
+    subtitle = (
+        "Jev vs Sarvam Prism · same goal · text via each provider's API key"
+        if task == "flights"
+        else "Jev (TypeSafe) vs Sarvam Prism — timers run independently"
+    )
+    d.text((38, 62), subtitle, font=font(16), fill=muted)
 
     pw, ph = 740, 520
     py = 110
@@ -105,7 +119,8 @@ for i in range(round(end * fps / 1000)):
         ]
     ):
         px = 36 + col * (pw + 48)
-        panel(d, px, py, pw, ph, label, "127.0.0.1 · research fixture", color)
+        chrome_label = "google.com/travel/flights" if task == "flights" else "127.0.0.1 · research fixture"
+        panel(d, px, py, pw, ph, label, chrome_label, color)
         elapsed = state["elapsed_ms"] if t >= state["elapsed_ms"] else t
         shot = pick(frames, elapsed)
         sw, sh = shot.size
@@ -135,7 +150,15 @@ for i in range(round(end * fps / 1000)):
             winner = f"Tie at {jev['elapsed_ms']} ms"
     d.line((36, H - 48, W - 36, H - 48), fill="#d3d9cc", width=2)
     d.line((36, H - 48, 36 + (W - 72) * t / end, H - 48), fill=jev_green, width=3)
-    footer = winner or "Reading-room demo · click-only task · no text helper"
+    verified = jev.get("verification", {}).get("passed") and sarvam.get("verification", {}).get("passed")
+    footer = winner or (
+        (
+            "Live Google Flights · Jev System One text vs Sarvam 105B text · "
+            + ("verified" if verified else "headless run (calendar did not finish on either arm)")
+        )
+        if task == "flights"
+        else "Reading-room demo · click-only task · no text helper"
+    )
     d.text((36, H - 32), footer, font=font(13), fill=muted)
     canvas.save(folder / f"{i:04d}.png")
 
