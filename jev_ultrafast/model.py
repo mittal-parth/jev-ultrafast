@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import threading
 import time
 
 import httpx
@@ -10,12 +11,45 @@ import httpx
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+_PROVIDER = threading.local()
+
+
+def use_decision_provider(provider):
+    """Pin Jev vs Sarvam for this thread (comparison runs must not share os.environ)."""
+    _PROVIDER.name = provider.lower()
+
+
+def decision_client():
+    """Jev (TypeSafe) or Sarvam Prism — same System-1 request shape, different hosts."""
+    provider = getattr(_PROVIDER, "name", None) or os.environ.get("DECISION_PROVIDER", "jev")
+    provider = provider.lower()
+    if provider == "sarvam":
+        key = os.environ.get("SARVAM_API_KEY")
+        if not key:
+            raise RuntimeError("Sarvam Prism needs SARVAM_API_KEY; no action executed.")
+        return {
+            "url": os.environ.get("SARVAM_DECISIONS_URL", "https://api.sarvam.ai/v2/systemone"),
+            "key": key,
+            "model": os.environ.get("DECISION_MODEL", "sarvam-prism"),
+        }
+    key = os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        raise RuntimeError("Jev needs JEV_API_KEY or TYPESAFE_API_KEY; no action executed.")
+    return {
+        "url": os.environ.get("TYPESAFE_DECISIONS_URL", "https://api.typesafe.ai/v1/systemone"),
+        "key": key,
+        "model": os.environ.get("DECISION_MODEL") or os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+    }
 
 
 def post_json(url, key, body):
+    if "sarvam.ai" in url:
+        auth = {"api-subscription-key": key, "Authorization": f"Bearer {key}"}
+    else:
+        auth = {"Authorization": f"Bearer {key}"}
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers=auth)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -104,8 +138,9 @@ def choose(state, goal, history):
             },
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
+    client = decision_client()
     body = {
-        "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+        "model": client["model"],
         "state": {
             "page": {k: state[k] for k in ("url", "title", "text")},
             "elements": elements,
@@ -116,7 +151,7 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    result = post_json(client["url"], client["key"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
