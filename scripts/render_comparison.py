@@ -27,11 +27,29 @@ hold_ms = 2500 if task == "flights" else 800
 
 
 def load_frames(run_dir):
+    """Prefer per-action screenshots; CDP screencast times are not agent elapsed_ms."""
+    steps = run_dir / "step_frames"
+    if steps.exists():
+        action_frames = sorted(
+            (int(p.stem), Image.open(p).convert("RGB")) for p in steps.glob("*.jpg") if p.stem.isdigit()
+        )
+        if action_frames:
+            return action_frames
     sc = run_dir / "screencast"
     frames = [(0, Image.open(run_dir / "frames" / "000000.jpg").convert("RGB"))]
     if sc.exists():
-        frames += sorted((int(p.stem), Image.open(p).convert("RGB")) for p in sc.glob("*.jpg"))
+        raw = sorted((int(p.stem), Image.open(p).convert("RGB")) for p in sc.glob("*.jpg"))
+        if raw:
+            t0 = raw[0][0]
+            frames = [(ts - t0, im) for ts, im in raw]
     return frames
+
+
+def last_action(state, t):
+    for entry in reversed(state.get("history", [])):
+        if entry.get("executed_ms", entry.get("elapsed_ms", 0)) <= t:
+            return entry.get("action", "")
+    return ""
 
 
 jev_frames = load_frames(source / "jev")
@@ -42,7 +60,9 @@ folder.mkdir(parents=True, exist_ok=True)
 
 def _load_font(size, bold=False):
     for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
         if bold
         else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -133,6 +153,10 @@ for i in range(round(end * fps / 1000)):
         timer_color = color if done else ink
         d.text((px + 16, py + ph + 14), f"{elapsed / 1000:05.2f}s", font=mono(36), fill=timer_color)
         d.text((px + 16, py + ph + 58), model_name, font=font(14), fill=muted)
+        action = last_action(state, elapsed)
+        if action:
+            short = action if len(action) <= 42 else action[:39] + "…"
+            d.text((px + 16, py + ph + 82), short, font=font(13), fill=ink)
         decisions = [x for x in state["decisions"] if x["elapsed_ms"] <= elapsed]
         if decisions:
             med = sorted(x["latency_ms"] for x in decisions)[len(decisions) // 2]

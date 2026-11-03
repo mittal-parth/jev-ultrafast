@@ -127,18 +127,17 @@ def run_arm(name, provider, url, out_dir, results, *, verify_fn, task_label):
     folder = out_dir / name
     folder.mkdir(parents=True, exist_ok=True)
     errors = []
-    agent = Agent(url, GOALS if task_label == "flights" else RESEARCH_GOAL, record_dir=folder / "step_frames", screenshots=True)
+    goal = GOALS if task_label == "flights" else RESEARCH_GOAL
+    agent = Agent(url, goal, record_dir=folder / "step_frames", screenshots=True)
     (folder / "frames").mkdir(exist_ok=True)
     (folder / "frames" / "000000.jpg").write_bytes(
         base64.b64decode(agent.browser.call("Page.captureScreenshot", format="jpeg", quality=85)["data"])
     )
-    epoch_holder = [None]
+    epoch_holder = [time.time()]
     stop, worker, screencast = capture_screencast(agent, folder, epoch_holder, errors)
     state = None
     try:
         for state in agent.run():
-            if agent.state.get("started_at") is not None and epoch_holder[0] is None:
-                epoch_holder[0] = time.time() - agent.state["started_at"]
             action = state["history"][-1]["action"] if state["history"] else ""
             print(f"[{name}]", state["elapsed_ms"], state["status"], action, flush=True)
     finally:
